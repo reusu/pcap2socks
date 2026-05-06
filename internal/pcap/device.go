@@ -53,11 +53,20 @@ type Device struct {
 
 	handle *pcap.Handle
 	rmu    sync.Mutex
+	wmu    sync.Mutex // serializes WritePacketData; libpcap handles are not thread-safe
 	closed atomic.Bool
 	done   chan struct{}
 
 	mu       sync.Mutex
-	ipMACTab map[string]net.HardwareAddr
+	ipMACTab map[string]*learnedEntry
+}
+
+// learnedEntry tracks an IP→MAC binding and whether it has been propagated to
+// the gvisor neighbor cache. registered may flip back to false when the MAC
+// changes for an IP.
+type learnedEntry struct {
+	mac        net.HardwareAddr
+	registered bool
 }
 
 // Open creates the pcap handle, sets the BPF filter, sends a gratuitous ARP,
@@ -77,12 +86,20 @@ func Open(cfg Config) (*Device, error) {
 	}
 	defer inactive.CleanUp()
 
+	// snapLen must cover the largest ethernet frame we expect. cfg.MTU is the
+	// IP-layer MTU; the ethernet frame can be up to cfg.MTU + ethHeaderLen,
+	// plus a small slack for VLAN tags or 802.1Q-like trailers. Hard-coding
+	// 1600 silently truncated jumbo frames.
+	snapLen := int(cfg.MTU) + ethHeaderLen + 64
+	if snapLen < 1600 {
+		snapLen = 1600
+	}
 	for _, step := range []struct {
 		name string
 		fn   func() error
 	}{
 		{"promisc", func() error { return inactive.SetPromisc(true) }},
-		{"snaplen", func() error { return inactive.SetSnapLen(1600) }},
+		{"snaplen", func() error { return inactive.SetSnapLen(snapLen) }},
 		{"timeout", func() error { return inactive.SetTimeout(pcap.BlockForever) }},
 		{"immediate", func() error { return inactive.SetImmediateMode(true) }},
 		{"buffer", func() error { return inactive.SetBufferSize(512 * 1024) }},
@@ -122,12 +139,12 @@ func Open(cfg Config) (*Device, error) {
 		cfg:      cfg,
 		handle:   handle,
 		done:     make(chan struct{}),
-		ipMACTab: make(map[string]net.HardwareAddr),
+		ipMACTab: make(map[string]*learnedEntry),
 	}
 
 	// Announce ourselves so devices update their ARP caches immediately.
 	if frame, err := BuildGratuitousARP(cfg.LocalIP, cfg.LocalMAC); err == nil {
-		if werr := handle.WritePacketData(frame); werr != nil {
+		if werr := d.sendFrame(frame); werr != nil {
 			slog.Warn("pcap: gratuitous arp write failed", "err", werr)
 		} else {
 			slog.Info("arp: gratuitous broadcast", "ip", cfg.LocalIP.String(), "mac", cfg.LocalMAC.String())
@@ -135,6 +152,15 @@ func Open(cfg Config) (*Device, error) {
 	}
 
 	return d, nil
+}
+
+// sendFrame writes a raw ethernet frame via the pcap handle under wmu. All
+// outbound paths (gratuitous ARP, ARP replies, stack-originated frames) must
+// go through this so concurrent writers don't race inside libpcap.
+func (d *Device) sendFrame(p []byte) error {
+	d.wmu.Lock()
+	defer d.wmu.Unlock()
+	return d.handle.WritePacketData(p)
 }
 
 // Close releases the underlying pcap handle and signals readers to stop.
@@ -198,11 +224,13 @@ func (d *Device) Read() []byte {
 	}
 }
 
-// Write sends a frame out via pcap.
+// Write sends a frame out via pcap. Returns the underlying error on failure
+// to honor the io.Writer contract — returning (0, nil) for a non-empty p
+// would let callers like buffer.View.WriteTo loop forever.
 func (d *Device) Write(p []byte) (int, error) {
-	if err := d.handle.WritePacketData(p); err != nil {
+	if err := d.sendFrame(p); err != nil {
 		slog.Error("pcap: write packet", "err", err)
-		return 0, nil
+		return 0, err
 	}
 	return len(p), nil
 }
@@ -230,7 +258,7 @@ func (d *Device) handleARP(frame []byte) {
 	if err != nil || reply == nil {
 		return
 	}
-	if err := d.handle.WritePacketData(reply); err != nil {
+	if err := d.sendFrame(reply); err != nil {
 		slog.Warn("pcap: arp reply write", "err", err)
 		return
 	}
@@ -244,27 +272,47 @@ func (d *Device) learn(ip net.IP, mac net.HardwareAddr) {
 	}
 	key := string(v4)
 	d.mu.Lock()
-	prev, ok := d.ipMACTab[key]
-	if ok && bytes.Equal(prev, mac) {
-		d.mu.Unlock()
-		return
+	entry, ok := d.ipMACTab[key]
+	macChanged := !ok || !bytes.Equal(entry.mac, mac)
+	if !ok {
+		entry = &learnedEntry{}
+		d.ipMACTab[key] = entry
 	}
-	d.ipMACTab[key] = append(net.HardwareAddr(nil), mac...)
+	if macChanged {
+		entry.mac = append(net.HardwareAddr(nil), mac...)
+		entry.registered = false
+	}
+	needRegister := !entry.registered
 	d.mu.Unlock()
 
 	if !ok {
 		slog.Info("device joined", "ip", v4.String(), "mac", mac.String())
 	}
-	if d.cfg.StackGetter != nil {
-		if s := d.cfg.StackGetter(); s != nil {
-			s.AddStaticNeighbor(
-				d.cfg.NICID,
-				header.IPv4ProtocolNumber,
-				tcpip.AddrFrom4Slice(v4),
-				tcpip.LinkAddress(mac),
-			)
-		}
+	// Retry AddStaticNeighbor on every packet until it succeeds. The first
+	// frame may arrive before main has finished publishing the stack pointer
+	// (StackGetter returns nil); without retrying, gvisor's neighbor cache
+	// would silently miss this IP and replies would not route.
+	if !needRegister || d.cfg.StackGetter == nil {
+		return
 	}
+	s := d.cfg.StackGetter()
+	if s == nil {
+		return
+	}
+	if err := s.AddStaticNeighbor(
+		d.cfg.NICID,
+		header.IPv4ProtocolNumber,
+		tcpip.AddrFrom4Slice(v4),
+		tcpip.LinkAddress(mac),
+	); err != nil {
+		// Leave registered=false so the next packet retries.
+		return
+	}
+	d.mu.Lock()
+	if curr, ok := d.ipMACTab[key]; ok && bytes.Equal(curr.mac, mac) {
+		curr.registered = true
+	}
+	d.mu.Unlock()
 }
 
 // findPcapDevice locates the pcap interface whose addresses overlap ifce.

@@ -154,6 +154,13 @@ func relayUDP(socksServer, chain string, src, dst *net.UDPAddr, local *gonet.UDP
 			chain, atomic.LoadInt64(&sent), atomic.LoadInt64(&recv)))
 	}()
 
+	// done signals all helper goroutines (tcpCtl reader, idle watchdog) to
+	// exit when relayUDP returns. Without this, the watchdog kept running
+	// for up to udpIdleTimeout (60s) after every flow ended, leaking
+	// goroutines proportional to flow churn.
+	done := make(chan struct{})
+	defer close(done)
+
 	// If the SOCKS5 control TCP closes, tear the whole flow down (RFC 1928).
 	go func() {
 		buf := make([]byte, 64)
@@ -173,6 +180,8 @@ func relayUDP(socksServer, chain string, src, dst *net.UDPAddr, local *gonet.UDP
 		defer t.Stop()
 		for {
 			select {
+			case <-done:
+				return
 			case <-idleReset:
 				if !t.Stop() {
 					select {
