@@ -1,0 +1,91 @@
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (leave empty to skip release, e.g. v1.0.0)'
+        required: false
+        type: string
+
+jobs:
+  build:
+    name: ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64, runner: ubuntu-latest }
+          - { goos: linux,   goarch: arm64, runner: ubuntu-24.04-arm }
+          - { goos: darwin,  goarch: arm64, runner: macos-latest }
+          - { goos: windows, goarch: amd64, runner: windows-latest }
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install libpcap
+        if: matrix.goos == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev
+
+      - name: Install Npcap SDK
+        if: matrix.goos == 'windows'
+        shell: bash
+        run: |
+          curl -fsSL https://npcap.com/dist/npcap-sdk-1.13.zip -o npcap-sdk.zip
+          unzip -q npcap-sdk.zip -d npcap-sdk
+          SDK="$(cygpath -m "$GITHUB_WORKSPACE")/npcap-sdk"
+          echo "CGO_CFLAGS=-I${SDK}/Include" >> "$GITHUB_ENV"
+          echo "CGO_LDFLAGS=-L${SDK}/Lib/x64" >> "$GITHUB_ENV"
+
+      - name: Build
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: ./build.sh
+
+      - name: Package
+        shell: bash
+        run: |
+          BIN="pcap2socks_${{ matrix.goos }}_${{ matrix.goarch }}"
+          [ "${{ matrix.goos }}" = "windows" ] && BIN="${BIN}.exe"
+          tar -czvf "build/pcap2socks_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz" \
+            -C build "${BIN}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pcap2socks_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: build/pcap2socks_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    if: inputs.tag != ''
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ inputs.tag }}" dist/*.tar.gz \
+            --title "${{ inputs.tag }}" \
+            --generate-notes
