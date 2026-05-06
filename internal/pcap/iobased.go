@@ -20,9 +20,14 @@ const outQueueLen = 1 << 10
 
 // ReadWriter is the contract the iobased endpoint expects from a packet
 // source/sink (in our case, the pcap device).
+//
+// Done returns a channel that is closed when the source is shutting down so
+// the dispatch loop can exit promptly instead of spinning on Read returning
+// nil.
 type ReadWriter interface {
 	Read() []byte
 	Write(p []byte) (int, error)
+	Done() <-chan struct{}
 }
 
 // Endpoint adapts a frame-oriented ReadWriter (libpcap) into a gvisor
@@ -77,10 +82,24 @@ func (e *Endpoint) Wait() { e.wg.Wait() }
 
 func (e *Endpoint) dispatchLoop(cancel context.CancelFunc) {
 	defer cancel()
+	done := e.rw.Done()
 	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
 		data := e.rw.Read()
 		if len(data) == 0 {
-			continue
+			// Distinguish "Read returned because device closed" from "Read
+			// got an uninteresting frame and returned empty"; we never block
+			// here, just give the next loop iteration a chance to observe done.
+			select {
+			case <-done:
+				return
+			default:
+				continue
+			}
 		}
 		if !e.IsAttached() {
 			continue

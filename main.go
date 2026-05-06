@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 
 	pcapdev "pcap2socks/internal/pcap"
@@ -84,7 +85,10 @@ func main() {
 	printDeviceInstructions(network, gwIP, mtu)
 
 	const nicID = tcpip.NICID(1)
-	var stackRef *stackHolder = &stackHolder{}
+	// stackRef is set after stack.Create returns. The pcap dispatch goroutine
+	// can already call StackGetter (via learn()) before that, so we publish
+	// the pointer atomically and the getter tolerates a nil load.
+	var stackRef atomic.Pointer[stackpkg.NeighborStack]
 
 	dev, err := pcapdev.Open(pcapdev.Config{
 		Interface: *ifce,
@@ -94,7 +98,11 @@ func main() {
 		MTU:       mtu - ethernetOverhead(),
 		NICID:     nicID,
 		StackGetter: func() pcapdev.NeighborSetter {
-			return stackRef.get()
+			s := stackRef.Load()
+			if s == nil {
+				return nil
+			}
+			return s
 		},
 		VerboseARP: *verbose,
 	})
@@ -118,23 +126,13 @@ func main() {
 	if err != nil {
 		fatal("create stack: %v", err)
 	}
-	stackRef.set(s)
+	stackRef.Store((*stackpkg.NeighborStack)(s))
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	<-sig
 	slog.Info("shutting down")
 }
-
-// stackHolder lets the device learn neighbors before we've finished building
-// the stack — at startup we hand it a closure that resolves to the stack
-// once Create returns.
-type stackHolder struct {
-	s pcapdev.NeighborSetter
-}
-
-func (h *stackHolder) get() pcapdev.NeighborSetter  { return h.s }
-func (h *stackHolder) set(s pcapdev.NeighborSetter) { h.s = s }
 
 // parseSource accepts either:
 //   - "192.168.1.0/24"  (CIDR; gateway = .1, or .2 if .1 is the network's first host... use .1)

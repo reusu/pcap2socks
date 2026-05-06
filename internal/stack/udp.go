@@ -26,6 +26,11 @@ const (
 	// ask-once-answer-once; keeping the relay socket open longer just wastes
 	// fds when the device burns through one ephemeral src port per query.
 	dnsIdleTimeout = 3 * time.Second
+
+	// dnsMaxPacketLen covers EDNS0 responses (typically negotiated to 1232,
+	// 4096, or up to 65535). 4096 handles the common ceiling without burning
+	// 64K per flow like udpMaxPacketLen would.
+	dnsMaxPacketLen = 4096
 )
 
 func newUDPForwarder(s *stack.Stack, socksServer, gatewayIP, dnsRelay string) *udp.Forwarder {
@@ -90,7 +95,7 @@ func relayDNS(dnsRelay, chain string, src *net.UDPAddr, local *gonet.UDPConn) {
 
 	// local -> relay
 	go func() {
-		buf := make([]byte, 1500)
+		buf := make([]byte, dnsMaxPacketLen)
 		for {
 			_ = local.SetReadDeadline(time.Now().Add(dnsIdleTimeout))
 			n, _, rerr := local.ReadFrom(buf)
@@ -108,7 +113,7 @@ func relayDNS(dnsRelay, chain string, src *net.UDPAddr, local *gonet.UDPConn) {
 	}()
 
 	// relay -> local
-	buf := make([]byte, 1500)
+	buf := make([]byte, dnsMaxPacketLen)
 	for {
 		_ = rc.SetReadDeadline(time.Now().Add(dnsIdleTimeout))
 		n, _, rerr := rc.ReadFromUDP(buf)

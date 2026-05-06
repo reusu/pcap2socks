@@ -54,6 +54,7 @@ type Device struct {
 	handle *pcap.Handle
 	rmu    sync.Mutex
 	closed atomic.Bool
+	done   chan struct{}
 
 	mu       sync.Mutex
 	ipMACTab map[string]net.HardwareAddr
@@ -120,6 +121,7 @@ func Open(cfg Config) (*Device, error) {
 	d := &Device{
 		cfg:      cfg,
 		handle:   handle,
+		done:     make(chan struct{}),
 		ipMACTab: make(map[string]net.HardwareAddr),
 	}
 
@@ -135,15 +137,21 @@ func Open(cfg Config) (*Device, error) {
 	return d, nil
 }
 
-// Close releases the underlying pcap handle.
+// Close releases the underlying pcap handle and signals readers to stop.
 func (d *Device) Close() {
 	if d.closed.Swap(true) {
 		return
 	}
+	close(d.done)
 	if d.handle != nil {
 		d.handle.Close()
 	}
 }
+
+// Done returns a channel that is closed when the device is shutting down.
+// The iobased Endpoint uses this to break out of its dispatch loop instead of
+// spinning on Read() returning nil.
+func (d *Device) Done() <-chan struct{} { return d.done }
 
 // Read returns the next ethernet frame to feed into the stack. It transparently
 // answers ARP requests directed at us (writing the reply via pcap) and returns

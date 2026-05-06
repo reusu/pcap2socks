@@ -15,6 +15,10 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 )
 
+// NeighborStack is an alias for *stack.Stack exposed so that callers can
+// store it in an atomic.Pointer without importing gvisor directly.
+type NeighborStack = stack.Stack
+
 // Config configures the userspace stack.
 type Config struct {
 	LinkEndpoint stack.LinkEndpoint

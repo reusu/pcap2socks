@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"time"
 )
 
 const (
@@ -33,20 +34,23 @@ func Connect(ctx context.Context, server, target string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := handshake(c); err != nil {
-		c.Close()
-		return nil, err
-	}
-	addr, err := encodeAddr(target)
-	if err != nil {
-		c.Close()
-		return nil, err
-	}
-	if _, err := writeRequest(c, cmdConnect, addr); err != nil {
-		c.Close()
-		return nil, err
-	}
-	if _, err := readReply(c); err != nil {
+	// Apply ctx deadline to the handshake exchange too — without this, a
+	// SOCKS server that accepts TCP but never speaks would hang us forever.
+	// Cleared on success so io.Copy in the caller isn't artificially deadlined.
+	if err := withCtxDeadline(ctx, c, func() error {
+		if err := handshake(c); err != nil {
+			return err
+		}
+		addr, err := encodeAddr(target)
+		if err != nil {
+			return err
+		}
+		if _, err := writeRequest(c, cmdConnect, addr); err != nil {
+			return err
+		}
+		_, err = readReply(c)
+		return err
+	}); err != nil {
 		c.Close()
 		return nil, err
 	}
@@ -62,43 +66,58 @@ func UDPAssociate(ctx context.Context, server string) (net.Conn, *net.UDPAddr, e
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := handshake(c); err != nil {
-		c.Close()
-		return nil, nil, err
-	}
-	// Per RFC 1928 §6: if the client doesn't yet know its source addr/port,
-	// it MUST send all zeros. We do; the server's reply contains the relay.
-	zeroAddr := []byte{atypIPv4, 0, 0, 0, 0, 0, 0}
-	if _, err := writeRequest(c, cmdUDPAssociate, zeroAddr); err != nil {
-		c.Close()
-		return nil, nil, err
-	}
-	bnd, err := readReply(c)
-	if err != nil {
-		c.Close()
-		return nil, nil, err
-	}
-	relay := bnd.UDPAddr()
-	if relay == nil {
-		c.Close()
-		return nil, nil, fmt.Errorf("socks5: server returned non-IP relay address")
-	}
-	// If the server replies with an unspecified IP (0.0.0.0/::), use the
-	// server's host — the relay lives on the same machine.
-	if relay.IP.IsUnspecified() {
-		host, _, _ := net.SplitHostPort(server)
-		ip := net.ParseIP(host)
-		if ip == nil {
-			ips, lerr := net.DefaultResolver.LookupIP(ctx, "ip", host)
-			if lerr != nil || len(ips) == 0 {
-				c.Close()
-				return nil, nil, fmt.Errorf("socks5: resolve relay host %s: %w", host, lerr)
-			}
-			ip = ips[0]
+
+	var relay *net.UDPAddr
+	if err := withCtxDeadline(ctx, c, func() error {
+		if err := handshake(c); err != nil {
+			return err
 		}
-		relay.IP = ip
+		// Per RFC 1928 §6: if the client doesn't yet know its source addr/port,
+		// it MUST send all zeros. We do; the server's reply contains the relay.
+		zeroAddr := []byte{atypIPv4, 0, 0, 0, 0, 0, 0}
+		if _, err := writeRequest(c, cmdUDPAssociate, zeroAddr); err != nil {
+			return err
+		}
+		bnd, err := readReply(c)
+		if err != nil {
+			return err
+		}
+		relay = bnd.UDPAddr()
+		if relay == nil {
+			return fmt.Errorf("socks5: server returned non-IP relay address")
+		}
+		// If the server replies with an unspecified IP (0.0.0.0/::), use the
+		// server's host — the relay lives on the same machine.
+		if relay.IP.IsUnspecified() {
+			host, _, _ := net.SplitHostPort(server)
+			ip := net.ParseIP(host)
+			if ip == nil {
+				ips, lerr := net.DefaultResolver.LookupIP(ctx, "ip", host)
+				if lerr != nil || len(ips) == 0 {
+					return fmt.Errorf("socks5: resolve relay host %s: %w", host, lerr)
+				}
+				ip = ips[0]
+			}
+			relay.IP = ip
+		}
+		return nil
+	}); err != nil {
+		c.Close()
+		return nil, nil, err
 	}
 	return c, relay, nil
+}
+
+// withCtxDeadline applies ctx's deadline to c for the duration of fn, then
+// clears it. If ctx has no deadline, fn runs without one.
+func withCtxDeadline(ctx context.Context, c net.Conn, fn func() error) error {
+	if dl, ok := ctx.Deadline(); ok {
+		if err := c.SetDeadline(dl); err != nil {
+			return err
+		}
+		defer c.SetDeadline(time.Time{})
+	}
+	return fn()
 }
 
 // EncodeUDP wraps payload in a SOCKS5 UDP request header (§7) addressed to dst.
